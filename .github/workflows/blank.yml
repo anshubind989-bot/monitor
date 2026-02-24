@@ -53,7 +53,7 @@ jobs:
           mkdir -p recon
           touch recon/all_subs.txt
 
-          subfinder -d nasa.gov -silent | sort -u > recon/current.txt
+          subfinder -d bookipi.com -silent | sort -u > recon/current.txt
 
 # ---------------- DIFF ----------------
 
