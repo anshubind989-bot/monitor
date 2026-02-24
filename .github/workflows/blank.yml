@@ -1,0 +1,172 @@
+name: Elite Continuous Recon
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+# ---------------- INSTALL STACK ----------------
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip jq
+
+          install_tool () {
+            TOOL=$1
+            VERSION=$(curl -s https://api.github.com/repos/projectdiscovery/$TOOL/releases/latest | jq -r '.tag_name' | sed 's/v//')
+            curl -sL https://github.com/projectdiscovery/$TOOL/releases/download/v${VERSION}/${TOOL}_${VERSION}_linux_amd64.zip -o ${TOOL}.zip
+            unzip -o ${TOOL}.zip
+            sudo mv $TOOL /usr/local/bin/
+            rm -f ${TOOL}.zip $TOOL
+          }
+
+          install_tool subfinder
+          install_tool dnsx
+          install_tool httpx
+          install_tool nuclei
+          install_tool katana
+          install_tool notify
+
+          go install github.com/lc/gau/v2/cmd/gau@latest
+          go install github.com/haccer/subjack@latest
+
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+          nuclei -update-templates
+
+# ---------------- ENUM ----------------
+
+      - name: Subdomain Discovery
+        run: |
+          mkdir -p recon
+          touch recon/all_subs.txt
+
+          subfinder -d nasa.gov -silent | sort -u > recon/current.txt
+
+# ---------------- DIFF ----------------
+
+      - name: New Assets
+        id: diff
+        run: |
+          grep -Fvxf recon/all_subs.txt recon/current.txt > recon/new.txt || true
+
+          if [ -s recon/new.txt ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+            cat recon/new.txt >> recon/all_subs.txt
+            sort -u recon/all_subs.txt -o recon/all_subs.txt
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+          fi
+
+# ---------------- RESOLVE ----------------
+
+      - name: DNS Resolve
+        if: steps.diff.outputs.found == 'true'
+        run: dnsx -l recon/new.txt -silent -o recon/resolved.txt
+
+# ---------------- LIVE HOSTS ----------------
+
+      - name: HTTPX Probe
+        if: steps.diff.outputs.found == 'true'
+        run: |
+          httpx -l recon/resolved.txt \
+            -silent -title -tech-detect -status-code \
+            -rl 50 \
+            -o recon/live.txt
+
+# ---------------- CRAWLING ----------------
+
+      - name: Crawl Endpoints (Katana)
+        if: steps.diff.outputs.found == 'true'
+        run: |
+          katana -list recon/live.txt \
+            -silent \
+            -jc \
+            -o recon/katana_urls.txt
+
+# ---------------- HISTORICAL URLS ----------------
+
+      - name: Gather URLs (GAU)
+        if: steps.diff.outputs.found == 'true'
+        run: |
+          gau < recon/live.txt > recon/gau_urls.txt
+
+          cat recon/katana_urls.txt recon/gau_urls.txt \
+            | sort -u > recon/all_urls.txt
+
+# ---------------- TAKEOVER CHECK ----------------
+
+      - name: Subdomain Takeover Scan
+        if: steps.diff.outputs.found == 'true'
+        run: |
+          subjack -w recon/resolved.txt -timeout 30 -ssl \
+            -o recon/takeovers.txt || true
+
+# ---------------- VULNERABILITY SCAN ----------------
+
+      - name: Nuclei Vulnerabilities
+        if: steps.diff.outputs.found == 'true'
+        run: |
+          nuclei -l recon/live.txt \
+            -severity critical,high \
+            -silent \
+            -rl 25 \
+            -o recon/vulns.txt
+
+# ---------------- SECRET SCAN ----------------
+
+      - name: Exposure & Secrets
+        if: steps.diff.outputs.found == 'true'
+        run: |
+          nuclei -l recon/all_urls.txt \
+            -tags exposure,token,apikey,secret \
+            -silent \
+            -o recon/secrets.txt
+
+# ---------------- NOTIFY SETUP ----------------
+
+      - name: Configure Notify
+        if: steps.diff.outputs.found == 'true'
+        run: |
+          mkdir -p ~/.config/notify
+          cat <<EOF > ~/.config/notify/provider-config.yaml
+          slack:
+            - id: elite
+              slack_channel: C0A5M7P61N3
+              slack_username: EliteRecon
+              slack_format: "{{data}}"
+              slack_webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          EOF
+
+# ---------------- ALERTS ----------------
+
+      - name: Send Alerts
+        if: steps.diff.outputs.found == 'true'
+        run: |
+          grep -i "critical" recon/vulns.txt | notify -provider elite || true
+          cat recon/takeovers.txt | notify -provider elite || true
+          cat recon/secrets.txt | notify -provider elite || true
+
+# ---------------- SAVE HISTORY ----------------
+
+      - name: Commit Updates
+        if: steps.diff.outputs.found == 'true'
+        run: |
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+
+          git add recon/all_subs.txt
+          git commit -m "Elite Recon Update $(date +'%F %T')"
+          git push
